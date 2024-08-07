@@ -25,6 +25,7 @@ import socket
 import ssl
 import sys
 import tempfile
+import textwrap
 from io import BytesIO
 
 
@@ -462,6 +463,69 @@ bar
         start_line, headers, response = self.wait()
         self.assertEqual(json_decode(response), {u'foo': [u'bar']})
 
+    def test_chunked_request_body_duplicate_header(self):
+        # Repeated Transfer-Encoding headers should be an error (and not confuse
+        # the chunked-encoding detection to mess up framing).
+        self.stream.write(
+            b"""\
+POST /echo HTTP/1.1
+Transfer-Encoding: chunked
+Transfer-encoding: chunked
+2
+ok
+0
+"""
+        )
+        with ExpectLog(
+            gen_log,
+            ".*Unsupported Transfer-Encoding chunked,chunked",
+        ):
+            start_line, headers, response = self.io_loop.run_sync(
+                lambda: read_stream_body(self.stream)
+            )
+        self.assertEqual(400, start_line.code)
+
+    def test_chunked_request_body_unsupported_transfer_encoding(self):
+        # We don't support transfer-encodings other than chunked.
+        self.stream.write(
+            b"""\
+POST /echo HTTP/1.1
+Transfer-Encoding: gzip, chunked
+2
+ok
+0
+"""
+        )
+        with ExpectLog(
+            gen_log, ".*Unsupported Transfer-Encoding gzip, chunked", level=logging.INFO
+        ):
+            start_line, headers, response = self.io_loop.run_sync(
+                lambda: read_stream_body(self.stream)
+            )
+        self.assertEqual(400, start_line.code)
+
+    def test_chunked_request_body_transfer_encoding_and_content_length(self):
+        # Transfer-encoding and content-length are mutually exclusive
+        self.stream.write(
+            b"""\
+POST /echo HTTP/1.1
+Transfer-Encoding: chunked
+Content-Length: 2
+2
+ok
+0
+"""
+        )
+        with ExpectLog(
+            gen_log,
+            ".*Message with both Transfer-Encoding and Content-Length",
+            level=logging.INFO,
+        ):
+            start_line, headers, response = self.io_loop.run_sync(
+                lambda: read_stream_body(self.stream)
+            )
+        self.assertEqual(400, start_line.code)
+
     @gen_test
     def test_invalid_content_length(self):
         with ExpectLog(gen_log, '.*Only integer Content-Length is allowed'):
@@ -473,7 +537,55 @@ bar
 
 """.replace(b"\n", b"\r\n"))
             yield self.stream.read_until_close()
+    def test_chunked_request_body_invalid_size(self):
+        # Only hex digits are allowed in chunk sizes. Python's int() function
+        # also accepts underscores, so make sure we reject them here.
+        self.stream.write(
+            b"""\
+POST /echo HTTP/1.1
+Transfer-Encoding: chunked
+1_a
+1234567890abcdef1234567890
+0
+""".replace(
+                b"\n", b"\r\n"
+            )
+        )
+        start_line, headers, response = self.io_loop.run_sync(
+            lambda: read_stream_body(self.stream)
+        )
+        self.assertEqual(400, start_line.code)
 
+    @gen_test
+    def test_invalid_content_length(self):
+        # HTTP only allows decimal digits in content-length. Make sure we don't
+        # accept anything else, with special attention to things accepted by the
+        # python int() function (leading plus signs and internal underscores).
+        test_cases = [
+            ("alphabetic", "foo"),
+            ("leading plus", "+10"),
+            ("internal underscore", "1_0"),
+        ]
+        for name, value in test_cases:
+            with self.subTest(name=name), closing(IOStream(socket.socket())) as stream:
+                with ExpectLog(
+                    gen_log,
+                    ".*Only integer Content-Length is allowed",
+                ):
+                    yield stream.connect(("127.0.0.1", self.get_http_port()))
+                    stream.write(
+                        utf8(
+                            textwrap.dedent(
+                                f"""\
+                            POST /echo HTTP/1.1
+                            Content-Length: {value}
+                            Connection: close
+                            1234567890
+                            """
+                            ).replace("\n", "\r\n")
+                        )
+                    )
+                    yield stream.read_until_close()
 
 class XHeaderTest(HandlerBaseTestCase):
     class Handler(RequestHandler):
@@ -949,6 +1061,44 @@ class StreamingChunkSizeTest(AsyncHTTPTestCase):
         self.fetch_chunk_sizes(body_producer=body_producer,
                                headers={'Content-Encoding': 'gzip'})
 
+class InvalidOutputContentLengthTest(AsyncHTTPTestCase):
+    class MessageDelegate(HTTPMessageDelegate):
+        def __init__(self, connection):
+            self.connection = connection
+
+        def headers_received(self, start_line, headers):
+            content_lengths = {
+                "normal": "10",
+                "alphabetic": "foo",
+                "leading plus": "+10",
+                "underscore": "1_0",
+            }
+            self.connection.write_headers(
+                ResponseStartLine("HTTP/1.1", 200, "OK"),
+                HTTPHeaders({"Content-Length": content_lengths[headers["x-test"]]}),
+            )
+            self.connection.write(b"1234567890")
+            self.connection.finish()
+
+    def get_app(self):
+        class App(HTTPServerConnectionDelegate):
+            def start_request(self, server_conn, request_conn):
+                return InvalidOutputContentLengthTest.MessageDelegate(request_conn)
+
+        return App()
+
+    def test_invalid_output_content_length(self):
+        with self.subTest("normal"):
+            response = self.fetch("/", method="GET", headers={"x-test": "normal"})
+            response.rethrow()
+            self.assertEqual(response.body, b"1234567890")
+        for test in ["alphabetic", "leading plus", "underscore"]:
+            with self.subTest(test):
+                # This log matching could be tighter but I think I'm already
+                # over-testing here.
+                with ExpectLog(app_log, "Uncaught exception"):
+                    with self.assertRaises(HTTPError):
+                        self.fetch("/", method="GET", headers={"x-test": test})
 
 class MaxHeaderSizeTest(AsyncHTTPTestCase):
     def get_app(self):
